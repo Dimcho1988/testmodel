@@ -1,52 +1,37 @@
-"""
-Wave-based component load optimizer for biathlon.
-
-This file can run in two modes:
-
-1) Streamlit mode, when Streamlit is installed:
-   pip install streamlit pandas numpy plotly
-   streamlit run streamlit_wave_load_optimizer.py
-
-2) Console/test mode, when Streamlit is NOT installed:
-   python streamlit_wave_load_optimizer.py
-   python streamlit_wave_load_optimizer.py --test
-   python streamlit_wave_load_optimizer.py --export-csv wave_component_training_plan.csv
-
-Why this structure exists:
-- Some sandboxed environments do not include Streamlit and do not allow installing packages.
-- The optimization/model logic should still be testable without Streamlit.
-- The Streamlit UI is loaded only inside run_streamlit_app(), so importing or running the model
-  will not fail when Streamlit is unavailable.
-"""
-
-from __future__ import annotations
-
-import argparse
-import importlib.util
 import math
-import sys
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
-try:
-    import pandas as pd
-except ModuleNotFoundError as exc:  # pragma: no cover
-    raise ModuleNotFoundError(
-        "This script requires pandas. Install it locally with: pip install pandas"
-    ) from exc
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
 
 
 # ============================================================
-# CORE MODEL
+# BIATHLON WAVE LOAD OPTIMIZER — STREAMLIT ONLY VERSION
 # ============================================================
-# Main idea:
-# - Components are ordered from general to specific.
-# - The model creates wave-like stress dynamics over weeks.
-# - Each mesocycle has max N accent components.
-# - Accents gradually move from general components to more specific/integrative ones.
-# - Competition weeks modify the planned stress profile automatically.
+# File name suggestion: app.py
+# requirements.txt:
+# streamlit
+# pandas
+# plotly
+#
+# Streamlit Cloud:
+# Main file path: app.py
 # ============================================================
 
+
+st.set_page_config(
+    page_title="Biathlon Wave Load Optimizer",
+    page_icon="🎯",
+    layout="wide",
+)
+
+
+# ============================================================
+# DATA
+# ============================================================
 
 DEFAULT_COMPONENTS = [
     {"component": "Z1 възстановителна издръжливост", "base_load": 180, "group": "Обща издръжливост", "specificity": 1},
@@ -83,27 +68,17 @@ class ModelParams:
     dev1_stress: float = 1.35
     dev2_stress: float = 1.45
     risk_limit: float = 1.60
-    competition_weeks: Optional[List[int]] = None
-
-    def __post_init__(self):
-        if self.weeks < 1:
-            raise ValueError("weeks must be >= 1")
-        if self.mesocycle_len < 1:
-            raise ValueError("mesocycle_len must be >= 1")
-        if self.max_accents < 1:
-            raise ValueError("max_accents must be >= 1")
-        if self.risk_limit <= 0:
-            raise ValueError("risk_limit must be positive")
+    competition_weeks: Tuple[int, ...] = (8, 12)
 
 
-def get_competition_weeks(params: ModelParams) -> List[int]:
-    return sorted(set(params.competition_weeks or []))
+# ============================================================
+# MODEL FUNCTIONS
+# ============================================================
 
 
-def parse_competition_weeks(text: str, weeks: int) -> List[int]:
-    """Parse comma- or semicolon-separated competition week numbers."""
+def parse_competition_weeks(text: str, weeks: int) -> Tuple[int, ...]:
     if not text or not text.strip():
-        return []
+        return tuple()
 
     result = []
     for raw in text.replace(";", ",").split(","):
@@ -116,7 +91,7 @@ def parse_competition_weeks(text: str, weeks: int) -> List[int]:
             continue
         if 1 <= week <= weeks:
             result.append(week)
-    return sorted(set(result))
+    return tuple(sorted(set(result)))
 
 
 def classify_stress(value: float) -> str:
@@ -128,9 +103,6 @@ def classify_stress(value: float) -> str:
 
 def mesocycle_week_type(week: int, mesocycle_len: int) -> str:
     position = ((week - 1) % mesocycle_len) + 1
-
-    if mesocycle_len == 1:
-        return "Развиваща"
     if position == 1:
         return "Вработваща"
     if mesocycle_len >= 4 and position == mesocycle_len:
@@ -142,9 +114,6 @@ def mesocycle_week_type(week: int, mesocycle_len: int) -> str:
 
 def accent_stress_for_week(week: int, params: ModelParams) -> float:
     position = ((week - 1) % params.mesocycle_len) + 1
-
-    if params.mesocycle_len == 1:
-        return params.dev1_stress
     if position == 1:
         return params.intro_stress
     if position == 2:
@@ -160,11 +129,11 @@ def validate_components(components_df: pd.DataFrame) -> pd.DataFrame:
     required = {"component", "base_load", "group", "specificity"}
     missing = required - set(components_df.columns)
     if missing:
-        raise ValueError(f"Missing required component columns: {sorted(missing)}")
+        raise ValueError(f"Липсват колони: {sorted(missing)}")
 
     cleaned = components_df.dropna(subset=["component", "base_load", "specificity"]).copy()
     if cleaned.empty:
-        raise ValueError("At least one valid component is required.")
+        raise ValueError("Трябва да има поне един компонент.")
 
     cleaned["component"] = cleaned["component"].astype(str)
     cleaned["group"] = cleaned["group"].astype(str)
@@ -172,9 +141,9 @@ def validate_components(components_df: pd.DataFrame) -> pd.DataFrame:
     cleaned["specificity"] = cleaned["specificity"].astype(int)
 
     if (cleaned["base_load"] < 0).any():
-        raise ValueError("base_load must be >= 0 for every component.")
+        raise ValueError("Базовият обем трябва да бъде >= 0.")
     if (cleaned["specificity"] < 1).any():
-        raise ValueError("specificity must be >= 1 for every component.")
+        raise ValueError("Специфичността трябва да бъде >= 1.")
 
     return cleaned.sort_values("specificity").reset_index(drop=True)
 
@@ -185,15 +154,8 @@ def select_accents_for_mesocycle(
     total_mesocycles: int,
     max_accents: int,
 ) -> List[str]:
-    """
-    Select max_accents components for the mesocycle.
-    Accents gradually move from low specificity to high specificity.
-    """
     ordered = components_df.sort_values("specificity").reset_index(drop=True)
     n_components = len(ordered)
-    if n_components == 0:
-        return []
-
     max_accents = min(max_accents, n_components)
 
     if total_mesocycles <= 1:
@@ -219,11 +181,6 @@ def component_phase_envelope(
     max_specificity: int,
     amplitude: float,
 ) -> float:
-    """
-    Smooth wave envelope.
-    Earlier components peak earlier; specific components peak later.
-    Returns a multiplier around 1.0.
-    """
     if weeks <= 1 or max_specificity <= 1:
         return 1.0
 
@@ -239,10 +196,9 @@ def apply_competition_logic(
     stress: float,
     component: str,
     week: int,
-    competition_weeks: List[int],
+    competition_weeks: Tuple[int, ...],
     risk_limit: float,
 ) -> Tuple[float, str]:
-    """Modify stress around competition weeks."""
     note = ""
     lower_component = component.lower()
     is_specific = any(k in lower_component for k in ["стрелба след", "интегрирана", "z5", "z6", "прагова"])
@@ -275,9 +231,7 @@ def apply_competition_logic(
 
 
 def generate_plan(components_df: pd.DataFrame, params: ModelParams) -> pd.DataFrame:
-    """Generate weekly stress and load targets for each component."""
     components_df = validate_components(components_df)
-    competition_weeks = get_competition_weeks(params)
 
     rows = []
     total_mesocycles = math.ceil(params.weeks / params.mesocycle_len)
@@ -311,16 +265,14 @@ def generate_plan(components_df: pd.DataFrame, params: ModelParams) -> pd.DataFr
             else:
                 stress = params.maintenance_stress
 
-            envelope = component_phase_envelope(
+            stress *= component_phase_envelope(
                 week=week,
                 weeks=params.weeks,
                 specificity_rank=specificity,
                 max_specificity=max_specificity,
                 amplitude=params.wave_amplitude,
             )
-            stress *= envelope
 
-            # Do not allow hidden non-accent components to become developing.
             if not is_accent and week_type != "Възстановителна":
                 stress = min(stress, 1.09)
 
@@ -328,12 +280,11 @@ def generate_plan(components_df: pd.DataFrame, params: ModelParams) -> pd.DataFr
                 stress=stress,
                 component=component,
                 week=week,
-                competition_weeks=competition_weeks,
+                competition_weeks=params.competition_weeks,
                 risk_limit=params.risk_limit,
             )
 
-            # Recovery week should stay recovery unless it is a competition week.
-            if week_type == "Възстановителна" and week not in competition_weeks:
+            if week_type == "Възстановителна" and week not in params.competition_weeks:
                 stress = min(stress, 0.85)
 
             target_load = base_load * stress * progression_factor
@@ -393,7 +344,6 @@ def make_accent_table(plan_df: pd.DataFrame) -> pd.DataFrame:
     accents = plan_df[plan_df["is_accent"]].copy()
     if accents.empty:
         return pd.DataFrame(columns=["mesocycle", "week", "accent_components"])
-
     return (
         accents.groupby(["mesocycle", "week"], as_index=False)["component"]
         .apply(lambda values: ", ".join(values))
@@ -404,7 +354,6 @@ def make_accent_table(plan_df: pd.DataFrame) -> pd.DataFrame:
 def diagnostic_checks(plan_df: pd.DataFrame, params: ModelParams) -> List[str]:
     issues: List[str] = []
     weekly_summary = make_weekly_summary(plan_df)
-    competition_weeks = get_competition_weeks(params)
 
     if (weekly_summary["accent_count"] > params.max_accents).any():
         issues.append("Има седмици с повече акценти от позволеното.")
@@ -419,7 +368,7 @@ def diagnostic_checks(plan_df: pd.DataFrame, params: ModelParams) -> List[str]:
     recovery_weeks = plan_df[plan_df["week_type"] == "Възстановителна"]
     if not recovery_weeks.empty:
         recovery_bad = recovery_weeks[
-            (recovery_weeks["stress"] > 0.90) & (~recovery_weeks["week"].isin(competition_weeks))
+            (recovery_weeks["stress"] > 0.90) & (~recovery_weeks["week"].isin(params.competition_weeks))
         ]
         if not recovery_bad.empty:
             issues.append("Някои възстановителни седмици не свалят достатъчно стреса.")
@@ -428,137 +377,15 @@ def diagnostic_checks(plan_df: pd.DataFrame, params: ModelParams) -> List[str]:
 
 
 # ============================================================
-# TESTS
+# CHART FUNCTIONS
 # ============================================================
-
-
-def _default_components_df() -> pd.DataFrame:
-    return pd.DataFrame(DEFAULT_COMPONENTS)
-
-
-def run_tests() -> None:
-    """Small self-contained test suite. No pytest required."""
-    components = _default_components_df()
-    params = ModelParams(weeks=12, mesocycle_len=4, max_accents=3, competition_weeks=[8, 12])
-    plan = generate_plan(components, params)
-
-    # Test 1: expected number of rows.
-    assert len(plan) == params.weeks * len(components), "Plan row count is incorrect."
-
-    # Test 2: no week exceeds the allowed number of accents.
-    weekly = make_weekly_summary(plan)
-    assert (weekly["accent_count"] <= params.max_accents).all(), "Too many accents in at least one week."
-
-    # Test 3: competition week strength components are reduced.
-    comp8_strength = plan[
-        (plan["week"] == 8)
-        & (plan["component"].str.contains("ОСИ|ССИ|силова", case=False, regex=True))
-    ]
-    assert not comp8_strength.empty, "Strength components were not found in test data."
-    assert (comp8_strength["stress"] <= 0.75).all(), "Strength should be reduced in competition week."
-
-    # Test 4: recovery weeks without competition should remain controlled.
-    recovery_non_comp = plan[(plan["week_type"] == "Възстановителна") & (~plan["week"].isin(params.competition_weeks or []))]
-    assert (recovery_non_comp["stress"] <= 0.85).all(), "Recovery week stress should be <= 0.85."
-
-    # Test 5: parser should ignore invalid values and remove duplicates.
-    assert parse_competition_weeks("3, 5, x, 5, 99", weeks=12) == [3, 5], "Competition parser failed."
-
-    # Test 6: accent selection should move toward more specific components later.
-    total_mesocycles = math.ceil(params.weeks / params.mesocycle_len)
-    early = select_accents_for_mesocycle(components, 0, total_mesocycles, 3)
-    late = select_accents_for_mesocycle(components, total_mesocycles - 1, total_mesocycles, 3)
-    early_mean = components[components["component"].isin(early)]["specificity"].mean()
-    late_mean = components[components["component"].isin(late)]["specificity"].mean()
-    assert late_mean > early_mean, "Accents should move from general to specific components."
-
-    # Test 7: diagnostic check should return a list, not crash.
-    issues = diagnostic_checks(plan, params)
-    assert isinstance(issues, list), "diagnostic_checks should return list."
-
-    print("All tests passed.")
-
-
-# ============================================================
-# CONSOLE FALLBACK
-# ============================================================
-
-
-def run_console_demo(export_csv: Optional[str] = None) -> None:
-    """Run the model without Streamlit and print useful tables."""
-    components = _default_components_df()
-    params = ModelParams(weeks=12, mesocycle_len=4, max_accents=3, competition_weeks=[8, 12])
-    plan = generate_plan(components, params)
-    weekly_summary = make_weekly_summary(plan)
-    accent_table = make_accent_table(plan)
-    issues = diagnostic_checks(plan, params)
-
-    print("\n=== Wave-based component load optimizer ===")
-    print("Streamlit is not required for this console demo.")
-    print("To use the visual UI locally, install Streamlit and run:")
-    print("  pip install streamlit pandas plotly")
-    print("  streamlit run streamlit_wave_load_optimizer.py")
-
-    print("\n=== Weekly summary ===")
-    print(weekly_summary.to_string(index=False))
-
-    print("\n=== Accent table ===")
-    print(accent_table.to_string(index=False))
-
-    print("\n=== First 20 plan rows ===")
-    columns = ["week", "week_type", "component", "status", "stress", "stress_zone", "target_load", "note"]
-    print(plan[columns].head(20).to_string(index=False))
-
-    print("\n=== Diagnostic checks ===")
-    if issues:
-        for issue in issues:
-            print(f"WARNING: {issue}")
-    else:
-        print("OK: Планът спазва основните ограничения.")
-
-    if export_csv:
-        plan.to_csv(export_csv, index=False, encoding="utf-8-sig")
-        print(f"\nCSV exported to: {export_csv}")
-
-
-# ============================================================
-# STREAMLIT UI
-# ============================================================
-
-
-def style_stress_table(df: pd.DataFrame):
-    def color_stress(value):
-        try:
-            v = float(value)
-        except Exception:
-            return ""
-        if v < 0.85:
-            return "background-color: #d9ead3"
-        if v < 1.10:
-            return "background-color: #fff2cc"
-        if v < 1.60:
-            return "background-color: #f9cb9c"
-        return "background-color: #e06666; color: white"
-
-    # Styler.applymap is still common, but map is preferred in newer pandas.
-    if hasattr(df.style, "map"):
-        return df.style.map(color_stress)
-    return df.style.applymap(color_stress)
 
 
 def build_full_stress_figure(
     plan_df: pd.DataFrame,
-    competition_weeks: List[int],
+    competition_weeks: Tuple[int, ...],
     title: str = "Цялостна вълнообразна динамика на компонентите",
 ):
-    """
-    Build the main Streamlit chart.
-
-    This is intentionally a separate helper so the app always shows one complete,
-    coach-readable overview chart when opened in Streamlit.
-    """
-    import plotly.graph_objects as go
-
     fig = go.Figure()
 
     ordered_components = (
@@ -573,7 +400,6 @@ def build_full_stress_figure(
         if data.empty:
             continue
 
-        # Normal line for the whole component.
         fig.add_trace(
             go.Scatter(
                 x=data["week"],
@@ -597,7 +423,6 @@ def build_full_stress_figure(
             )
         )
 
-        # Larger accent markers over the line.
         accents = data[data["is_accent"]]
         if not accents.empty:
             fig.add_trace(
@@ -617,18 +442,15 @@ def build_full_stress_figure(
                 )
             )
 
-    # Background stress zones.
     fig.add_hrect(y0=0.00, y1=0.85, fillcolor="green", opacity=0.08, line_width=0)
     fig.add_hrect(y0=0.85, y1=1.10, fillcolor="yellow", opacity=0.08, line_width=0)
     fig.add_hrect(y0=1.10, y1=1.60, fillcolor="orange", opacity=0.08, line_width=0)
     fig.add_hrect(y0=1.60, y1=2.00, fillcolor="red", opacity=0.08, line_width=0)
 
-    # Threshold lines.
-    fig.add_hline(y=0.85, line_dash="dash", annotation_text="0.85 възстановително", annotation_position="bottom right")
-    fig.add_hline(y=1.10, line_dash="dash", annotation_text="1.10 развиващо", annotation_position="bottom right")
-    fig.add_hline(y=1.60, line_dash="dash", annotation_text="1.60 риск", annotation_position="top right")
+    fig.add_hline(y=0.85, line_dash="dash", annotation_text="0.85 възстановително")
+    fig.add_hline(y=1.10, line_dash="dash", annotation_text="1.10 развиващо")
+    fig.add_hline(y=1.60, line_dash="dash", annotation_text="1.60 риск")
 
-    # Competition weeks.
     for week in competition_weeks:
         fig.add_vrect(
             x0=week - 0.5,
@@ -653,9 +475,6 @@ def build_full_stress_figure(
 
 
 def build_group_summary_figure(plan_df: pd.DataFrame):
-    """Build a cleaner chart by group mean stress."""
-    import plotly.express as px
-
     group_df = (
         plan_df.groupby(["week", "group"], as_index=False)
         .agg(mean_stress=("stress", "mean"), total_load=("target_load", "sum"))
@@ -680,254 +499,207 @@ def build_group_summary_figure(plan_df: pd.DataFrame):
     return fig
 
 
-def run_streamlit_app() -> None:
-    """Run the Streamlit UI. Imports Streamlit and Plotly only here."""
-    try:
-        import plotly.express as px
-        import streamlit as st
-    except ModuleNotFoundError as exc:  # pragma: no cover
-        missing = exc.name
-        print(
-            f"Missing optional UI dependency: {missing}\n"
-            "Console mode still works: python streamlit_wave_load_optimizer.py\n"
-            "For the visual UI, install locally:\n"
-            "  pip install streamlit plotly\n"
-            "  streamlit run streamlit_wave_load_optimizer.py",
-            file=sys.stderr,
-        )
-        raise SystemExit(1) from exc
+def style_stress_table(df: pd.DataFrame):
+    def color_stress(value):
+        try:
+            v = float(value)
+        except Exception:
+            return ""
+        if v < 0.85:
+            return "background-color: #d9ead3"
+        if v < 1.10:
+            return "background-color: #fff2cc"
+        if v < 1.60:
+            return "background-color: #f9cb9c"
+        return "background-color: #e06666; color: white"
 
-    st.set_page_config(
-        page_title="Biathlon Wave Load Optimizer",
-        page_icon="🎯",
-        layout="wide",
+    if hasattr(df.style, "map"):
+        return df.style.map(color_stress)
+    return df.style.applymap(color_stress)
+
+
+# ============================================================
+# STREAMLIT APP
+# ============================================================
+
+st.title("🎯 Вълнообразна динамика на тренировъчните компоненти")
+st.success("Приложението е заредено успешно.")
+st.caption(
+    "Прототип за автоматизирано планиране: компонентен стрес, максимум акценти, "
+    "преход от обща към специфична подготовка и корекции около състезания."
+)
+
+with st.sidebar:
+    st.header("1) Основни настройки")
+    weeks = st.slider("Брой седмици", min_value=4, max_value=32, value=12, step=1)
+    mesocycle_len = st.selectbox("Дължина на мезоцикъл", [3, 4, 5], index=1)
+    max_accents = st.slider("Максимум акценти в мезоцикъл", min_value=1, max_value=5, value=3, step=1)
+
+    st.header("2) Стрес зони")
+    intro_stress = st.slider("Вработваща седмица — стрес за акцент", 1.00, 1.40, 1.20, 0.01)
+    dev1_stress = st.slider("Развиваща седмица 1 — стрес за акцент", 1.05, 1.60, 1.35, 0.01)
+    dev2_stress = st.slider("Развиваща седмица 2 — стрес за акцент", 1.05, 1.60, 1.45, 0.01)
+    maintenance_stress = st.slider("Поддържащ стрес", 0.80, 1.10, 0.98, 0.01)
+    recovery_stress = st.slider("Възстановителен стрес", 0.50, 0.90, 0.75, 0.01)
+    risk_limit = st.slider("Горна граница за риск", 1.20, 1.80, 1.60, 0.01)
+
+    st.header("3) Форма на вълната")
+    progression = st.slider("Постепенно увеличение на общия товар", 0.00, 0.50, 0.20, 0.01)
+    wave_amplitude = st.slider("Амплитуда на компонентната вълна", 0.00, 0.60, 0.25, 0.01)
+
+    st.header("4) Състезания")
+    competition_text = st.text_input(
+        "Седмици със състезания",
+        value="8, 12",
+        help="Въведи седмици, разделени със запетая. Например: 8, 12",
     )
 
-    st.title("🎯 Вълнообразна динамика на тренировъчните компоненти")
-    st.caption(
-        "Прототип за автоматизирано планиране: компонентен стрес, максимум акценти, "
-        "преход от обща към специфична подготовка и корекции около състезания."
-    )
+competition_weeks = parse_competition_weeks(competition_text, weeks)
 
-    with st.sidebar:
-        st.header("1) Основни настройки")
-        weeks = st.slider("Брой седмици", min_value=4, max_value=32, value=12, step=1)
-        mesocycle_len = st.selectbox("Дължина на мезоцикъл", [3, 4, 5], index=1)
-        max_accents = st.slider("Максимум акценти в мезоцикъл", min_value=1, max_value=5, value=3, step=1)
+params = ModelParams(
+    weeks=weeks,
+    mesocycle_len=mesocycle_len,
+    max_accents=max_accents,
+    progression=progression,
+    wave_amplitude=wave_amplitude,
+    recovery_stress=recovery_stress,
+    maintenance_stress=maintenance_stress,
+    intro_stress=intro_stress,
+    dev1_stress=dev1_stress,
+    dev2_stress=dev2_stress,
+    risk_limit=risk_limit,
+    competition_weeks=competition_weeks,
+)
 
-        st.header("2) Стрес зони")
-        intro_stress = st.slider("Вработваща седмица — стрес за акцент", 1.00, 1.40, 1.20, 0.01)
-        dev1_stress = st.slider("Развиваща седмица 1 — стрес за акцент", 1.05, 1.60, 1.35, 0.01)
-        dev2_stress = st.slider("Развиваща седмица 2 — стрес за акцент", 1.05, 1.60, 1.45, 0.01)
-        maintenance_stress = st.slider("Поддържащ стрес", 0.80, 1.10, 0.98, 0.01)
-        recovery_stress = st.slider("Възстановителен стрес", 0.50, 0.90, 0.75, 0.01)
-        risk_limit = st.slider("Горна граница за риск", 1.20, 1.80, 1.60, 0.01)
+st.subheader("Входни компоненти")
+st.write(
+    "Подреди компонентите от най-общи към най-специфични чрез колоната `specificity`. "
+    "Колоната `base_load` е условен базов седмичен обем — минути, серии, патрони или точки според компонента."
+)
 
-        st.header("3) Форма на вълната")
-        progression = st.slider("Постепенно увеличение на общия товар", 0.00, 0.50, 0.20, 0.01)
-        wave_amplitude = st.slider("Амплитуда на компонентната вълна", 0.00, 0.60, 0.25, 0.01)
+components_df = pd.DataFrame(DEFAULT_COMPONENTS)
+components_df = st.data_editor(
+    components_df,
+    num_rows="dynamic",
+    use_container_width=True,
+    column_config={
+        "component": st.column_config.TextColumn("Компонент", required=True),
+        "base_load": st.column_config.NumberColumn("Базов седмичен обем", min_value=0.0, step=5.0, required=True),
+        "group": st.column_config.TextColumn("Група", required=True),
+        "specificity": st.column_config.NumberColumn("Специфичност / ред", min_value=1, step=1, required=True),
+    },
+)
 
-        st.header("4) Състезания")
-        competition_text = st.text_input(
-            "Седмици със състезания",
-            value="8, 12",
-            help="Въведи седмици, разделени със запетая. Например: 8, 12",
-        )
-
-    competition_weeks = parse_competition_weeks(competition_text, weeks)
-    params = ModelParams(
-        weeks=weeks,
-        mesocycle_len=mesocycle_len,
-        max_accents=max_accents,
-        progression=progression,
-        wave_amplitude=wave_amplitude,
-        recovery_stress=recovery_stress,
-        maintenance_stress=maintenance_stress,
-        intro_stress=intro_stress,
-        dev1_stress=dev1_stress,
-        dev2_stress=dev2_stress,
-        risk_limit=risk_limit,
-        competition_weeks=competition_weeks,
-    )
-
-    st.subheader("Входни компоненти")
-    st.write(
-        "Подреди компонентите от най-общи към най-специфични чрез колоната `specificity`. "
-        "Колоната `base_load` е условен базов седмичен обем — минути, серии, патрони или точки според компонента."
-    )
-
-    components_df = pd.DataFrame(DEFAULT_COMPONENTS)
-    components_df = st.data_editor(
-        components_df,
-        num_rows="dynamic",
-        use_container_width=True,
-        column_config={
-            "component": st.column_config.TextColumn("Компонент", required=True),
-            "base_load": st.column_config.NumberColumn("Базов седмичен обем", min_value=0.0, step=5.0, required=True),
-            "group": st.column_config.TextColumn("Група", required=True),
-            "specificity": st.column_config.NumberColumn("Специфичност / ред", min_value=1, step=1, required=True),
-        },
-    )
-
-    try:
-        components_df = validate_components(components_df)
-    except ValueError as exc:
-        st.warning(str(exc))
-        st.stop()
-
+try:
+    components_df = validate_components(components_df)
     plan_df = generate_plan(components_df, params)
-    weekly_summary = make_weekly_summary(plan_df)
-    accent_table = make_accent_table(plan_df)
-    issues = diagnostic_checks(plan_df, params)
+except Exception as exc:
+    st.error(f"Грешка при генериране на плана: {exc}")
+    st.stop()
 
-    st.subheader("Обобщение на модела")
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Седмици", weeks)
-    col2.metric("Мезоцикли", math.ceil(weeks / mesocycle_len))
-    col3.metric("Макс. акценти", max_accents)
-    col4.metric("Състезателни седмици", ", ".join(map(str, competition_weeks)) if competition_weeks else "няма")
+weekly_summary = make_weekly_summary(plan_df)
+accent_table = make_accent_table(plan_df)
+issues = diagnostic_checks(plan_df, params)
 
-    st.subheader("1) Цяла графика на вълнообразната динамика")
-    st.write(
-        "Това е основната графика на модела. Тя показва всички компоненти за целия период, "
-        "праговете на стреса, акцентите и състезателните седмици."
+st.subheader("Обобщение на модела")
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Седмици", weeks)
+col2.metric("Мезоцикли", math.ceil(weeks / mesocycle_len))
+col3.metric("Макс. акценти", max_accents)
+col4.metric("Състезателни седмици", ", ".join(map(str, competition_weeks)) if competition_weeks else "няма")
+
+st.subheader("1) Цяла графика на вълнообразната динамика")
+st.write(
+    "Това е основната графика на модела. Тя показва всички компоненти за целия период, "
+    "праговете на стреса, акцентите и състезателните седмици."
+)
+
+chart_mode = st.radio(
+    "Изглед на графиката",
+    options=["Всички компоненти", "Само акценти", "По групи"],
+    horizontal=True,
+)
+
+if chart_mode == "Всички компоненти":
+    fig_stress = build_full_stress_figure(
+        plan_df=plan_df,
+        competition_weeks=competition_weeks,
+        title="Цялостна вълнообразна динамика на всички компоненти",
     )
+    st.plotly_chart(fig_stress, use_container_width=True)
 
-    chart_mode = st.radio(
-        "Изглед на графиката",
-        options=["Всички компоненти", "Само акценти", "По групи"],
-        horizontal=True,
-    )
-
-    if chart_mode == "Всички компоненти":
+elif chart_mode == "Само акценти":
+    accent_only_df = plan_df[plan_df["is_accent"]].copy()
+    if accent_only_df.empty:
+        st.info("В текущите настройки няма избрани акценти.")
+    else:
         fig_stress = build_full_stress_figure(
-            plan_df=plan_df,
+            plan_df=accent_only_df,
             competition_weeks=competition_weeks,
-            title="Цялостна вълнообразна динамика на всички компоненти",
+            title="Динамика само на акцентираните компоненти",
         )
         st.plotly_chart(fig_stress, use_container_width=True)
 
-    elif chart_mode == "Само акценти":
-        accent_only_df = plan_df[plan_df["is_accent"]].copy()
-        if accent_only_df.empty:
-            st.info("В текущите настройки няма избрани акценти.")
-        else:
-            fig_stress = build_full_stress_figure(
-                plan_df=accent_only_df,
-                competition_weeks=competition_weeks,
-                title="Динамика само на акцентираните компоненти",
-            )
-            st.plotly_chart(fig_stress, use_container_width=True)
+else:
+    fig_group = build_group_summary_figure(plan_df)
+    st.plotly_chart(fig_group, use_container_width=True)
 
+st.subheader("2) Целеви седмичен обем по компоненти")
+fig_load = px.area(
+    plan_df,
+    x="week",
+    y="target_load",
+    color="component",
+    line_group="component",
+    hover_data=["week_type", "status", "stress", "stress_zone"],
+    title="Натрупване на целевия седмичен товар",
+)
+fig_load.update_layout(height=550, legend_title_text="Компонент")
+st.plotly_chart(fig_load, use_container_width=True)
+
+st.subheader("3) Карта на стреса")
+st.write("Вижда се кога даден компонент е възстановителен, поддържащ, развиващ или рисков.")
+stress_matrix = plan_df.pivot(index="component", columns="week", values="stress")
+st.dataframe(style_stress_table(stress_matrix), use_container_width=True)
+
+left, right = st.columns([1.1, 1])
+with left:
+    st.subheader("Седмично обобщение")
+    st.dataframe(weekly_summary, use_container_width=True)
+
+with right:
+    st.subheader("Акценти по седмици")
+    if accent_table.empty:
+        st.info("Няма избрани акценти.")
     else:
-        fig_group = build_group_summary_figure(plan_df)
-        st.plotly_chart(fig_group, use_container_width=True)
+        st.dataframe(accent_table, use_container_width=True)
 
-    st.subheader("2) Целеви седмичен обем по компоненти")
-    fig_load = px.area(
-        plan_df,
-        x="week",
-        y="target_load",
-        color="component",
-        line_group="component",
-        hover_data=["week_type", "status", "stress", "stress_zone"],
-        title="Натрупване на целевия седмичен товар",
-    )
-    fig_load.update_layout(height=550, legend_title_text="Компонент")
-    st.plotly_chart(fig_load, use_container_width=True)
+st.subheader("Пълен план по компоненти")
+filter_weeks = st.multiselect(
+    "Филтрирай седмици",
+    options=list(range(1, weeks + 1)),
+    default=list(range(1, min(weeks, 8) + 1)),
+)
+filtered = plan_df[plan_df["week"].isin(filter_weeks)].copy()
+st.dataframe(filtered, use_container_width=True, height=420)
 
-    st.subheader("3) Карта на стреса")
-    st.write("Вижда се кога даден компонент е възстановителен, поддържащ, развиващ или рисков.")
-    stress_matrix = plan_df.pivot(index="component", columns="week", values="stress")
-    st.dataframe(style_stress_table(stress_matrix), use_container_width=True)
+st.subheader("Автоматична проверка")
+if issues:
+    for issue in issues:
+        st.warning(issue)
+else:
+    st.success("Планът спазва основните ограничения: максимум акценти, контрол на риска и вълнообразна динамика.")
 
-    left, right = st.columns([1.1, 1])
-    with left:
-        st.subheader("Седмично обобщение")
-        st.dataframe(weekly_summary, use_container_width=True)
+st.subheader("Експорт")
+csv = plan_df.to_csv(index=False).encode("utf-8-sig")
+st.download_button(
+    label="⬇️ Изтегли плана като CSV",
+    data=csv,
+    file_name="wave_component_training_plan.csv",
+    mime="text/csv",
+)
 
-    with right:
-        st.subheader("Акценти по седмици")
-        if accent_table.empty:
-            st.info("Няма избрани акценти.")
-        else:
-            st.dataframe(accent_table, use_container_width=True)
-
-    st.subheader("Пълен план по компоненти")
-    filter_weeks = st.multiselect(
-        "Филтрирай седмици",
-        options=list(range(1, weeks + 1)),
-        default=list(range(1, min(weeks, 8) + 1)),
-    )
-    filtered = plan_df[plan_df["week"].isin(filter_weeks)].copy()
-    st.dataframe(filtered, use_container_width=True, height=420)
-
-    st.subheader("Автоматична проверка")
-    if issues:
-        for issue in issues:
-            st.warning(issue)
-    else:
-        st.success("Планът спазва основните ограничения: максимум акценти, контрол на риска и вълнообразна динамика.")
-
-    st.subheader("Експорт")
-    csv = plan_df.to_csv(index=False).encode("utf-8-sig")
-    st.download_button(
-        label="⬇️ Изтегли плана като CSV",
-        data=csv,
-        file_name="wave_component_training_plan.csv",
-        mime="text/csv",
-    )
-
-    st.info(
-        "Следваща стъпка: към всеки компонент може да се свърже база от конкретни тренировки. "
-        "Тогава моделът няма само да планира стреса, а ще избира реални тренировки ден по ден."
-    )
-
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
-
-
-def is_package_available(package_name: str) -> bool:
-    """Return True when a Python package can be imported."""
-    return importlib.util.find_spec(package_name) is not None
-
-
-def main(argv: Optional[List[str]] = None) -> None:
-    """
-    Entry point.
-
-    Important for Streamlit Cloud:
-    - The default behavior must be to run the Streamlit UI when Streamlit is installed.
-    - Older versions tried to detect Streamlit runtime context and could fall back to console mode,
-      which creates a blank white Streamlit page.
-    """
-    parser = argparse.ArgumentParser(description="Wave-based component load optimizer for biathlon.")
-    parser.add_argument("--test", action="store_true", help="Run self-contained tests.")
-    parser.add_argument("--console", action="store_true", help="Run console demo instead of Streamlit UI.")
-    parser.add_argument("--export-csv", type=str, default=None, help="Export console-demo plan to CSV.")
-
-    # parse_known_args prevents Streamlit/Cloud from breaking the app if it passes extra arguments.
-    args, _unknown = parser.parse_known_args(argv)
-
-    if args.test:
-        run_tests()
-        return
-
-    if args.console or args.export_csv:
-        run_console_demo(export_csv=args.export_csv)
-        return
-
-    # Main cloud/local behavior: if Streamlit is available, always show the UI.
-    # This prevents the blank-page problem caused by accidentally running console mode inside Streamlit.
-    if is_package_available("streamlit"):
-        run_streamlit_app()
-        return
-
-    # Fallback for restricted environments without Streamlit.
-    run_console_demo(export_csv=None)
-
-
-if __name__ == "__main__":
-    main()
+st.info(
+    "Следваща стъпка: към всеки компонент може да се свърже база от конкретни тренировки. "
+    "Тогава моделът няма само да планира стреса, а ще избира реални тренировки ден по ден."
+)
