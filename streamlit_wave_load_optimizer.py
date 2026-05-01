@@ -22,6 +22,7 @@ Why this structure exists:
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import math
 import sys
 from dataclasses import dataclass
@@ -888,36 +889,44 @@ def run_streamlit_app() -> None:
 # ============================================================
 
 
+def is_package_available(package_name: str) -> bool:
+    """Return True when a Python package can be imported."""
+    return importlib.util.find_spec(package_name) is not None
+
+
 def main(argv: Optional[List[str]] = None) -> None:
+    """
+    Entry point.
+
+    Important for Streamlit Cloud:
+    - The default behavior must be to run the Streamlit UI when Streamlit is installed.
+    - Older versions tried to detect Streamlit runtime context and could fall back to console mode,
+      which creates a blank white Streamlit page.
+    """
     parser = argparse.ArgumentParser(description="Wave-based component load optimizer for biathlon.")
     parser.add_argument("--test", action="store_true", help="Run self-contained tests.")
-    parser.add_argument("--streamlit", action="store_true", help="Run Streamlit UI explicitly.")
+    parser.add_argument("--console", action="store_true", help="Run console demo instead of Streamlit UI.")
     parser.add_argument("--export-csv", type=str, default=None, help="Export console-demo plan to CSV.")
-    args = parser.parse_args(argv)
+
+    # parse_known_args prevents Streamlit/Cloud from breaking the app if it passes extra arguments.
+    args, _unknown = parser.parse_known_args(argv)
 
     if args.test:
         run_tests()
         return
 
-    if args.streamlit:
+    if args.console or args.export_csv:
+        run_console_demo(export_csv=args.export_csv)
+        return
+
+    # Main cloud/local behavior: if Streamlit is available, always show the UI.
+    # This prevents the blank-page problem caused by accidentally running console mode inside Streamlit.
+    if is_package_available("streamlit"):
         run_streamlit_app()
         return
 
-    # Default behavior: safe console mode.
-    # When launched via `streamlit run`, Streamlit executes this script and the user can pass -- --streamlit,
-    # but most users should run directly with `streamlit run streamlit_wave_load_optimizer.py`.
-    # In that case Streamlit is importable, but __name__ is still __main__; therefore, to avoid console output
-    # inside Streamlit, we detect Streamlit's runtime if possible.
-    try:
-        from streamlit.runtime.scriptrunner import get_script_run_ctx  # type: ignore
-
-        if get_script_run_ctx() is not None:
-            run_streamlit_app()
-            return
-    except Exception:
-        pass
-
-    run_console_demo(export_csv=args.export_csv)
+    # Fallback for restricted environments without Streamlit.
+    run_console_demo(export_csv=None)
 
 
 if __name__ == "__main__":
