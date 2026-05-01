@@ -3,9 +3,14 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
+
+try:
+    import plotly.express as px
+    import plotly.graph_objects as go
+except ModuleNotFoundError:
+    px = None
+    go = None
 
 
 # ============================================================
@@ -27,6 +32,41 @@ st.set_page_config(
     page_icon="🎯",
     layout="wide",
 )
+
+if px is None or go is None:
+    st.error("Липсва библиотеката plotly. Приложението не може да покаже интерактивните графики без нея.")
+    st.markdown(
+        """
+        ### Как да го оправиш в Streamlit Cloud
+
+        В GitHub repository-то създай файл с точно име:
+
+        ```text
+        requirements.txt
+        ```
+
+        Вътре сложи тези три реда:
+
+        ```text
+        streamlit
+        pandas
+        plotly
+        ```
+
+        След това в Streamlit Cloud натисни:
+
+        ```text
+        Manage app → Clear cache and reboot
+        ```
+
+        Ако файлът `requirements.txt` вече съществува, просто добави реда:
+
+        ```text
+        plotly
+        ```
+        """
+    )
+    st.stop()
 
 
 # ============================================================
